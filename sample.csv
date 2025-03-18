@@ -1,4 +1,6 @@
-Name,Age,Location
-Alice,28,New York
-Bob,22,Los Angeles
-Charlie,30,San Francisco
+Name,Age,Salary,Active,JoinDate
+Alice,30,50000.00,true,2022-01-15
+Bob,25,60000.50,false,2021-08-22
+Charlie,35,70000.00,true,2020-03-10
+David,40,80000.00,true,2019-07-14
+Eve,28,55000.75,false,2023-02-25
