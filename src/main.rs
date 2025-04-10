@@ -1,54 +1,129 @@
-use csv::ReaderBuilder;
 use chrono::NaiveDate;
-use std::error::Error;
+use csv::ReaderBuilder;
+use rusqlite::Connection;
 use std::collections::HashMap;
+use std::error::Error;
 
+/// Guess column types from the first few rows of the CSV.
 fn guess_column_types(file_path: &str) -> Result<Vec<(String, String)>, Box<dyn Error>> {
-    let mut rdr = ReaderBuilder::new().has_headers(true).from_path(file_path)?;
-    let headers = rdr.headers()?.clone();  // Get headers (column names)
+    let mut rdr = ReaderBuilder::new()
+        .has_headers(true)
+        .from_path(file_path)?;
+    let headers = rdr.headers()?.clone();
     let mut column_types: HashMap<usize, String> = HashMap::new();
 
-    // Read the first few rows to guess the types (e.g., 5 rows)
     for result in rdr.records().take(5) {
         let record = result?;
-        
-        // Iterate over all columns in the current row
+
         for (index, value) in record.iter().enumerate() {
             let type_guess = if value == "true" || value == "false" {
-                "boolean".to_string()
+                "BOOLEAN"
             } else if value.parse::<i64>().is_ok() {
-                "integer".to_string()
+                "INTEGER"
             } else if value.parse::<f64>().is_ok() {
-                "float".to_string()
+                "REAL"
             } else if NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok() {
-                "date".to_string()
+                "DATE"
             } else {
-                "string".to_string()
+                "TEXT"
             };
-
-            // Store the guessed type for the column, prioritizing the first guess
-            column_types.entry(index).or_insert(type_guess);
+            column_types.entry(index).or_insert(type_guess.to_string());
         }
     }
 
-    // Collect column names and their guessed types in order
-    let mut column_info: Vec<(String, String)> = Vec::new();
-    for (index, column_type) in column_types {
-        let column_name = headers.get(index).unwrap_or(&"Unknown".to_string()).to_string();
-        column_info.push((column_name, column_type));
-    }
+    let column_info = headers
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let col_type = column_types.get(&i).cloned().unwrap_or("TEXT".to_string());
+            (name.to_string(), col_type)
+        })
+        .collect();
 
     Ok(column_info)
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
-    let file_path = "sample.csv";
-    let column_types = guess_column_types(file_path)?;
+/// Create a table and insert CSV contents into an SQLite database.
+fn csv_to_sqlite(csv_path: &str, db_path: &str, table_name: &str) -> Result<(), Box<dyn Error>> {
+    let column_info = guess_column_types(csv_path)?;
+    let conn = Connection::open(db_path)?;
 
-    // Output the column name and its guessed type in order
-    for (column_name, column_type) in column_types {
-        println!("Column '{}' has type: {}", column_name, column_type);
+    // Build CREATE TABLE statement
+    let columns_sql: Vec<String> = column_info
+        .iter()
+        .map(|(name, typ)| format!("\"{}\" {}", name, typ))
+        .collect();
+    let create_stmt = format!(
+        "CREATE TABLE IF NOT EXISTS \"{}\" ({})",
+        table_name,
+        columns_sql.join(", ")
+    );
+    conn.execute(&create_stmt, [])?;
+
+    // Read CSV again for insertion
+    let mut rdr = ReaderBuilder::new().has_headers(true).from_path(csv_path)?;
+    let headers = rdr.headers()?.clone();
+    let placeholders = vec!["?"; headers.len()].join(", ");
+    let insert_stmt = format!(
+        "INSERT INTO \"{}\" ({}) VALUES ({})",
+        table_name,
+        headers
+            .iter()
+            .map(|h| format!("\"{}\"", h))
+            .collect::<Vec<_>>()
+            .join(", "),
+        placeholders
+    );
+    let mut stmt = conn.prepare(&insert_stmt)?;
+
+    for result in rdr.records() {
+        let record = result?;
+        let values: Vec<rusqlite::types::Value> = record
+            .iter()
+            .enumerate()
+            .map(|(i, val)| match column_info[i].1.as_str() {
+                "INTEGER" => val
+                    .parse::<i64>()
+                    .map_or(rusqlite::types::Value::Null, rusqlite::types::Value::from),
+                "REAL" => val
+                    .parse::<f64>()
+                    .map_or(rusqlite::types::Value::Null, rusqlite::types::Value::from),
+                "BOOLEAN" => val
+                    .parse::<bool>()
+                    .map_or(rusqlite::types::Value::Null, rusqlite::types::Value::from),
+                "DATE" => NaiveDate::parse_from_str(val, "%Y-%m-%d")
+                    .map_or(rusqlite::types::Value::Null, |d| {
+                        rusqlite::types::Value::from(d.to_string())
+                    }),
+                _ => rusqlite::types::Value::from(val.to_string()),
+            })
+            .collect();
+
+        stmt.execute(rusqlite::params_from_iter(values))?;
     }
 
+    Ok(())
+}
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() != 2 {
+        eprintln!("Usage: {} <csv-file>", args[0]);
+        std::process::exit(1);
+    }
+
+    let csv_path = &args[1];
+    let db_path = if let Some(stripped) = csv_path.strip_suffix(".csv") {
+        format!("{}.db", stripped)
+    } else {
+        format!("{}.db", csv_path)
+    };
+    let table_name = "table";
+
+    csv_to_sqlite(csv_path, &db_path, table_name)?;
+    println!(
+        "CSV data inserted into '{}' table in '{}'",
+        table_name, db_path
+    );
     Ok(())
 }
